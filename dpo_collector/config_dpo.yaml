@@ -35,7 +35,12 @@ model:
                                         #   · OpenGVLab/InternVL2_5-4B → internvl 백엔드(.chat())
                                         #   · Qwen/Qwen2.5-VL-7B-Instruct 등 → hf 백엔드
   dtype: "bfloat16"                     # ⚠ InternVL 계열은 4bit 금지(InternViT 출력 깨짐)
-  device_map: "auto"                    # "auto" | "cuda:0" | null(수동 배치)
+  device_map: "auto"                    # ⚠️ 단일 GPU 환경이면 반드시 "cuda:0" 으로 바꾸세요.
+                                        #    "auto" 는 모델을 **여러 GPU에 쪼개 얹는** 설정이라,
+                                        #    GPU가 하나뿐이면 레이어가 엉뚱한 디바이스에 배치되어
+                                        #    "CUDA error: device-side assert triggered" 가 납니다.
+                                        #    선택지: "auto"(멀티 GPU) | "cuda:0" | "cuda:1" | null
+                                        #    ※ 아래 question_gen.device_map 도 함께 바꿔야 합니다.
   use_flash_attn: false                 # flash-attn 미설치 시 자동으로 기본 attention 으로 폴백
   max_num_tiles: 12                     # dynamic tiling 상한. 고해상도 도표/차트 성능에 직접 영향
   input_size: 448                       # InternVL 타일 한 변 크기 (internvl 백엔드에서만 사용)
@@ -50,7 +55,7 @@ question_gen:
   backend: "auto"
   name: "OpenGVLab/InternVL3_5-4B-HF"   # 텍스트 전용 LLM(Qwen3-14B 등)으로 교체 가능
   dtype: "bfloat16"
-  device_map: "auto"
+  device_map: "auto"                    # ⚠️ 단일 GPU 환경이면 "cuda:0" (model.device_map 과 동일하게)
   max_new_tokens: 256
   temperature: 0.8
   n_candidates: 3                       # 후보 질문 개수 (2~3)

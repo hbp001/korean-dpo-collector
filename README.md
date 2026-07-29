@@ -87,7 +87,7 @@ data_ko/
 
 ### 3. 설정
 
-`dpo_collector/config_dpo.yaml` 에서 최소 두 가지만 확인하면 됩니다.
+`dpo_collector/config_dpo.yaml` 에서 최소 세 가지만 확인하면 됩니다.
 
 ```yaml
 paths:
@@ -95,11 +95,39 @@ paths:
 
 model:
   name: "OpenGVLab/InternVL3_5-4B-HF"     # HF 모델명 — 자유 교체
+  device_map: "auto"                      # ⚠️ 단일 GPU 환경이면 "cuda:0" 으로 (아래 참고)
 ```
 
 모델은 **HuggingFace 이름만 바꾸면** 됩니다 (`Qwen/Qwen2.5-VL-7B-Instruct` 등).
 계열은 `config.json` 으로 자동 판별하며, 판별이 애매하면 `model.backend` 를 `hf` 또는
 `internvl` 로 지정하라는 오류가 납니다. 나머지 항목은 UI ⚙️ 설정 탭에서 편집할 수 있습니다.
+
+> #### ⚠️ 단일 GPU 환경이면 `device_map` 을 반드시 바꾸세요
+>
+> 기본값 `"auto"` 는 **모델을 여러 GPU에 쪼개 얹는** 설정입니다(accelerate).
+> GPU가 하나뿐이거나 멀티 GPU를 쓸 수 없는 환경에서 그대로 두면 레이어가
+> 엉뚱한 디바이스에 배치되어 아래 같은 오류가 납니다.
+>
+> ```
+> CUDA error: device-side assert triggered
+> Expected all tensors to be on the same device
+> ```
+>
+> `config_dpo.yaml` 의 **두 곳**을 모두 바꾸세요 — 답변 생성 모델과 질문 생성 모델입니다.
+>
+> ```yaml
+> model:
+>   device_map: "cuda:0"        # ← "auto" 에서 변경
+>
+> question_gen:
+>   device_map: "cuda:0"        # ← 여기도 함께
+> ```
+>
+> 특정 GPU를 쓰려면 `"cuda:1"` 처럼 번호를 지정하거나, 실행할 때
+> `CUDA_VISIBLE_DEVICES=1 python scripts/run_dpo_collector.py` 로 넘겨도 됩니다.
+> `null` 로 두면 코드가 알아서 단일 디바이스에 올립니다(`cuda` 없으면 CPU).
+>
+> 멀티 GPU 서버라면 `"auto"` 가 맞습니다 — 4B 모델도 한 장에 다 안 들어갈 때 자동 분산됩니다.
 
 ### 4. 실행
 
@@ -241,6 +269,8 @@ outputs/
 
 | 증상 | 해결 |
 |---|---|
+| `CUDA error: device-side assert triggered` | 단일 GPU 환경인데 `device_map: "auto"` 인 경우가 대부분입니다. `model`·`question_gen` 의 `device_map` 을 `"cuda:0"` 으로 바꾸세요 ([위 안내](#3-설정)) |
+| `Expected all tensors to be on the same device` | 위와 같은 원인입니다 |
 | `백엔드 계열을 판별할 수 없습니다` | `config_dpo.yaml` 의 `model.backend` 를 `hf` 또는 `internvl` 로 지정 |
 | KG 구축 후 논문이 0편 | `kg.language_filter` 를 `null` 로 두거나 데이터가 한국어인지 확인 |
 | 질문 생성이 템플릿 문장으로만 나옴 | 모델 로드 실패 시 폴백입니다. 로그에서 로드 오류를 확인하세요 |
