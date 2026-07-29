@@ -543,7 +543,84 @@ def _matching_question_meta(
 
 def skip_and_next(ctx: AppContext) -> str:
     """현재 후보를 저장하지 않고 넘어갈 때의 안내."""
-    return "↩️ 저장하지 않고 넘어갑니다. 새 질문을 생성하세요."
+    return "↩️ 저장하지 않고 다음 항목으로 넘어갑니다."
+
+
+# ─── 다음 항목으로 이동 ────────────────────────────────────────────────────
+#
+# 수집은 "질문 생성 → 답변 생성 → 선택 → 저장"을 수백 번 반복하는 작업이라,
+# 한 건을 끝낸 뒤 손이 멈추지 않는 것이 중요하다. 저장 직후 다음 근거를 바로
+# 띄우고, 이전 후보/선택은 확실히 비워 **직전 답변을 실수로 다시 저장하는 것**을 막는다.
+
+def clear_collection_state() -> Tuple[Any, ...]:
+    """
+    수집 화면의 후보/선택/메모를 비운다.
+
+    Returns: (질문 라디오, 질문 입력, chosen, rejected, 답변 상세, 메모, 답변 세션)
+    """
+    return (
+        _visible_choices(0, "후보 질문"),
+        gr.update(value=""),
+        _visible_choices(0, "후보"),
+        _visible_choices(0, "후보"),
+        gr.update(value=""),
+        gr.update(value=""),
+        {"candidates": [], "images": []},
+    )
+
+
+def advance_paper(
+    ctx: AppContext, current: Optional[str], step: int = 1
+) -> Tuple[Any, str]:
+    """
+    논문 드롭다운을 다음(또는 이전) 논문으로 옮긴다.
+
+    수집 가능한 논문(평가 전용 제외) 안에서만 순환하며, 끝에 닿으면 처음으로 돌아간다.
+    """
+    if not ctx.bridge or not ctx.bridge.is_ready:
+        return gr.update(), "⚠️ 먼저 **KG 구축** 탭에서 KG를 준비하세요."
+
+    held = ctx.bridge.excluded_papers
+    papers = [p for p in ctx.bridge.papers_in_graph() if p not in held]
+    if not papers:
+        return gr.update(), "⚠️ 수집 가능한 논문이 없습니다."
+
+    if current in papers:
+        idx = (papers.index(current) + step) % len(papers)
+    else:
+        idx = 0
+    nxt = papers[idx]
+    return gr.update(value=nxt), f"📄 논문 이동 → `{nxt}`  ({idx + 1}/{len(papers)})"
+
+
+def save_result_ok(message: str) -> bool:
+    """`save_pair` 가 돌려준 메시지가 성공인지 (자동 진행 여부 판단)."""
+    return message.strip().startswith("✅")
+
+
+def maybe_advance(
+    ctx: AppContext,
+    save_message: str,
+    auto_next: bool,
+    paper_id: Optional[str],
+    n_candidates: int,
+    max_hops: int,
+    require_image: bool,
+    q_session: Dict[str, Any],
+    progress=gr.Progress(),
+) -> Tuple[Any, Any, Any, Dict[str, Any]]:
+    """
+    저장 결과에 따라 다음 질문을 띄운다.
+    반환 형태는 `generate_questions` 와 같다 (질문 라디오, 근거, 갤러리, 질문 세션).
+
+    **저장에 실패했으면 넘어가지 않는다** — 중복이나 검증 실패로 저장되지 않았는데
+    화면만 다음으로 넘어가면 수집자가 저장된 줄 알고 지나치게 된다.
+    """
+    if not auto_next or not save_result_ok(save_message):
+        return gr.update(), gr.update(), gr.update(), (q_session or {"candidates": []})
+    return generate_questions(
+        ctx, paper_id, n_candidates, max_hops, require_image, progress
+    )
 
 
 # ─── 🎯 학습 탭 ────────────────────────────────────────────────────────────
@@ -1154,7 +1231,14 @@ def build_ui(ctx: AppContext) -> gr.Blocks:
                             )
                         with gr.Row():
                             save_btn = gr.Button("💾 페어 저장", variant="primary", scale=2)
-                            skip_btn = gr.Button("↩️ 건너뛰기", scale=1)
+                            skip_btn = gr.Button("↩️ 건너뛰고 다음", scale=1)
+                        with gr.Row():
+                            auto_next = gr.Checkbox(
+                                value=True, scale=2,
+                                label="저장하면 자동으로 다음 항목 (같은 논문)",
+                            )
+                            next_paper_btn = gr.Button("📄 다음 논문 ▶", scale=1)
+                            prev_paper_btn = gr.Button("◀ 이전 논문", scale=1)
                         save_msg = gr.Markdown("")
 
                 gr.Markdown("---")
@@ -1498,15 +1582,58 @@ def build_ui(ctx: AppContext) -> gr.Blocks:
             inputs=[a_session], outputs=[rejected_radio],
         )
 
+        #: 다음 항목으로 넘어갈 때 비울 컴포넌트 (이전 선택이 남아 오저장되는 것 방지)
+        _clear_targets = [
+            q_radio, question_box, chosen_radio, rejected_radio,
+            answers_md, notes, a_session,
+        ]
+        _advance_inputs = [paper_dd, n_q, max_hops, require_img]
+        _advance_outputs = [q_radio, evidence_md, images_gallery, q_session]
+
         save_btn.click(
             lambda q, a_s, q_s, ci, ri, m, an, nt:
                 save_pair(ctx, q, a_s, q_s, ci, ri, m, an, nt),
             inputs=[question_box, a_session, q_session,
                     chosen_radio, rejected_radio, mode, annotator, notes],
             outputs=[save_msg, progress_md],
+        ).then(
+            # 저장이 성공했고 자동 진행이 켜져 있을 때만 다음 근거를 띄운다
+            lambda msg, auto, pid, n, hops, ri, qs, progress=gr.Progress():
+                maybe_advance(ctx, msg, auto, pid, n, hops, ri, qs, progress),
+            inputs=[save_msg, auto_next, *_advance_inputs, q_session],
+            outputs=_advance_outputs,
+        ).then(
+            # 새 질문이 떴으면 이전 후보/선택을 비운다 (질문 라디오는 위에서 갱신됨)
+            lambda msg, auto: (
+                clear_collection_state()[1:] if (auto and save_result_ok(msg))
+                else tuple(gr.update() for _ in range(6))
+            ),
+            inputs=[save_msg, auto_next],
+            outputs=_clear_targets[1:],
         )
 
-        skip_btn.click(lambda: skip_and_next(ctx), outputs=[save_msg])
+        skip_btn.click(
+            lambda: skip_and_next(ctx), outputs=[save_msg],
+        ).then(
+            lambda pid, n, hops, ri, progress=gr.Progress():
+                generate_questions(ctx, pid, n, hops, ri, progress),
+            inputs=_advance_inputs, outputs=_advance_outputs,
+        ).then(
+            lambda: clear_collection_state()[1:], outputs=_clear_targets[1:],
+        )
+
+        # 논문 이동 → 이동한 논문에서 바로 새 질문을 띄운다
+        for _btn, _step in ((next_paper_btn, 1), (prev_paper_btn, -1)):
+            _btn.click(
+                (lambda s: lambda cur: advance_paper(ctx, cur, s))(_step),
+                inputs=[paper_dd], outputs=[paper_dd, save_msg],
+            ).then(
+                lambda pid, n, hops, ri, progress=gr.Progress():
+                    generate_questions(ctx, pid, n, hops, ri, progress),
+                inputs=_advance_inputs, outputs=_advance_outputs,
+            ).then(
+                lambda: clear_collection_state()[1:], outputs=_clear_targets[1:],
+            )
         refresh_btn.click(lambda: ctx.progress_markdown(), outputs=[progress_md])
 
         # ── 학습 탭 ───────────────────────────────────────────────────────
