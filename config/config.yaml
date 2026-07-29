@@ -1,0 +1,198 @@
+# ============================================================
+# Multimodal Sci-Tech VLM Research System - Master Config
+# ============================================================
+
+project:
+  name: "sci_vlm"
+  version: "0.1.0"
+  description: "Knowledge Graph based Self-Play VLM for Scientific Literature"
+
+# Data paths
+# 현재 컨테이너 기준 실제 경로. 환경변수로 덮어쓸 수 있음:
+#   SCIVLM_DATA_ROOT / SCIVLM_OUTPUT_DIR / HF_HOME
+data:
+  root:   "data"
+  output: "outputs"
+  logs:   "logs"
+  cache:  "${HF_HOME}"
+
+# ============================================================
+# Model Configuration (change here to switch models)
+# ============================================================
+models:
+  vllm:
+    # 주 학습 대상 백본 (targets.yaml의 primary_model과 일치해야 함)
+    # -HF 리비전: transformers 네이티브(InternVLForConditionalGeneration),
+    #             custom_code 불필요, LLM=Qwen3ForCausalLM → LoRA target 표준
+    name: "OpenGVLab/InternVL3_5-4B-HF"
+    dtype: "auto"                  # auto | bfloat16 | float16
+    device_map: "auto"
+    use_flash_attention: false     # set true if flash-attn installed
+    max_new_tokens: 1024
+    temperature: 0.7
+    top_p: 0.9
+
+  text_llm:
+    # For text-only tasks (relation extraction, reward, etc.)
+    name: "Qwen/Qwen3-VL-4B-Instruct"  # reuse same model
+    dtype: "auto"
+    device_map: "auto"
+
+  embeddings:
+    name: "sentence-transformers/all-MiniLM-L6-v2"
+    device: "cpu"                  # cpu | cuda
+
+# ============================================================
+# Knowledge Graph Configuration (Phase 1)
+# ============================================================
+knowledge_graph:
+  # Graph DB backend: "networkx" (dev) | "neo4j" (production)
+  backend: "networkx"
+
+  neo4j:
+    uri: "${NEO4J_URI}"            # docker-compose에서 주입 (bolt://neo4j:7687)
+    user: "${NEO4J_USER}"          # neo4j
+    password: "${NEO4J_PASSWORD}"  # scivlm1234
+    database: "neo4j"
+
+  # Node types
+  node_types:
+    - TextBlock
+    - Figure
+    - Table
+    - Equation
+    - Concept
+    - Claim
+    - Paper           # cross-document root node
+
+  # Edge types and weights for random walk
+  edge_types:
+    CONTAINS:         {weight: 0.3, bidirectional: false}
+    HAS_CAPTION:      {weight: 0.5, bidirectional: false}
+    REFERENCES:       {weight: 0.8, bidirectional: true}
+    ILLUSTRATES:      {weight: 0.9, bidirectional: false}
+    QUANTIFIES:       {weight: 0.8, bidirectional: false}
+    DEFINES:          {weight: 0.85, bidirectional: false}
+    SUPPORTS:         {weight: 0.9, bidirectional: false}
+    CONTRADICTS:      {weight: 0.95, bidirectional: true}
+    DERIVES_FROM:     {weight: 0.85, bidirectional: false}
+    COMPARES:         {weight: 0.9, bidirectional: true}
+    SAME_CONCEPT:     {weight: 1.0, bidirectional: true}  # cross-doc
+
+  # Structural graph
+  structural:
+    enabled: true
+    parse_hierarchy: true          # Section > Subsection > Paragraph
+
+  # Reference graph
+  reference:
+    enabled: true
+    patterns:
+      - "As shown in Figure {n}"
+      - "Table {n} shows"
+      - "Figure {n} illustrates"
+      - "see Table {n}"
+      - "shown in Fig. {n}"
+      - "Equation {n}"
+      - "Eq. {n}"
+
+  # Semantic relation graph
+  semantic:
+    enabled: true
+    similarity_threshold: 0.75    # cosine sim threshold for edges
+    max_edges_per_node: 10
+    batch_size: 32
+
+  # Cross-document federation
+  cross_document:
+    enabled: true
+    coreference_threshold: 0.85   # concept merging threshold
+
+  # ── VLM 기반 시각적 맥락 분석 ──────────────────────────────────────────
+  # Qwen3-VL을 사용하여 이미지 내용을 이해하고 KG를 보강합니다.
+  # GPU가 없거나 빠른 테스트 시 enabled: false로 설정
+  vlm_enrichment:
+    enabled: false                 # true: VLM 사용 / false: 스킵 (기본 꺼짐)
+    figure_description: true      # ① Figure/Table 이미지 설명 생성
+    visual_text_relation: true    # ② 시각-텍스트 관계 엣지 분류
+    concept_extraction: true      # ③ 텍스트에서 Concept/Claim 노드 추출
+    max_figures_per_paper: 20     # GPU 메모리 절약: 논문당 최대 처리 이미지 수
+    max_text_nodes_for_concept: 30
+    batch_size: 4
+
+  # Graph storage
+  storage:
+    format: "json"                 # json | pickle | graphml
+    save_interval: 10             # save every N papers
+
+# ============================================================
+# Self-Play Configuration (Phase 2)
+# ============================================================
+self_play:
+  enabled: true
+
+  # Curriculum Learning
+  n_epochs: 30                       # 전체 epoch 수
+  questions_per_epoch: 100
+  reward_threshold: 0.35
+  n_samples_per_question: 3          # Self-Consistency 샘플 수
+
+  # ── 모델 업데이트 주기 제어 ─────────────────────────────────────────
+  update_every_n_epochs: 1           # N epoch마다 업데이트
+  min_examples_to_update: 3          # 이 수 미만이면 업데이트 스킵 (lowered from 10)
+
+  # ── Mini-batch 업데이트 (epoch 내 더 자주 업데이트) ─────────────────
+  mini_batch_size: 15                 # 0 = 기존 방식 (epoch 단위 1회)
+                                     # 10 = 10개마다 즉시 GRPO 업데이트
+                                     # 권장: questions_per_epoch의 1/5
+
+  # Reasoning Path
+  max_hops: 3
+  difficulty_levels: 4          # 1(VQA) ~ 4(InstructionFollowing)
+
+  # 보상 가중치 (Curriculum에 의해 동적 조정됨)
+  r_answer_weight: 0.5
+  r_path_weight: 0.3
+  r_consistency_weight: 0.2
+
+  # KG 정제
+  prune_threshold: 0.15
+  merge_threshold: 0.88
+
+  # LoRA
+  lora:
+    r: 16
+    lora_alpha: 32
+    target_modules: ["q_proj", "v_proj"]
+    lora_dropout: 0.05
+
+  # 학습
+  learning_rate: 2.0e-4
+  batch_size: 2
+  gradient_accumulation_steps: 4
+  max_steps_per_epoch: 100
+  dpo_beta: 0.1
+
+# ============================================================
+# MCP Tool Interface (Phase 3)
+# ============================================================
+mcp:
+  enabled: false                   # Phase 3 - not yet active
+  host: "0.0.0.0"
+  port: 8765
+
+# ============================================================
+# Orchestration (Phase 4)
+# ============================================================
+orchestration:
+  enabled: false                   # Phase 4 - not yet active
+  max_parallel_tasks: 4
+
+# ============================================================
+# Logging
+# ============================================================
+logging:
+  level: "INFO"                    # DEBUG | INFO | WARNING | ERROR
+  format: "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+  file: "/workspace/logs/sci_vlm.log"
+  rotation: "100 MB"

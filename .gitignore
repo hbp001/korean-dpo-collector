@@ -1,0 +1,38 @@
+# ── 수집/학습 산출물 (사용자 데이터) ──
+outputs/
+*.jsonl
+!dpo_collector/**/*.example.jsonl
+
+# ── 논문 데이터 (저작권 — 저장소에 넣지 않습니다) ──
+data_ko/*
+!data_ko/.gitkeep
+data/
+data_final/
+
+# ── 모델 가중치 / 캐시 ──
+*.safetensors
+*.bin
+*.pt
+*.pth
+hf_cache/
+.cache/
+
+# ── 설정 백업 (타임스탬프 백업은 로컬 전용) ──
+*.bak
+*.tmp
+*.lock
+
+# ── Python ──
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# ── 에디터 / OS ──
+.vscode/
+.idea/
+.DS_Store
