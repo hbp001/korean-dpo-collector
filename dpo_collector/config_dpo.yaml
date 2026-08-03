@@ -17,6 +17,7 @@ paths:
   adapter_dir:  "outputs/adapters"
   state_json:   "outputs/state.json"
   history_json: "outputs/training_history.json"
+  comparisons_jsonl: "outputs/comparisons.jsonl"   # base vs 학습 모델 정성 비교 기록
   # ── 고정 평가셋 (eval_ko.py) ──
   splits_json:       "outputs/splits.json"        # 논문 분할(동결)
   eval_jsonl:        "outputs/eval_ko.jsonl"      # 확정 평가셋

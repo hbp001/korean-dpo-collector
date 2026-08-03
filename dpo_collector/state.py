@@ -87,6 +87,7 @@ class StateStore:
         state_json: str,
         history_json: Optional[str] = None,
         adapter_dir: Optional[str] = None,
+        comparisons_json: Optional[str] = None,
     ):
         self.path = Path(state_json)
         self.history_path = (
@@ -95,6 +96,11 @@ class StateStore:
         )
         self.adapter_dir = Path(adapter_dir) if adapter_dir \
             else self.path.parent / "adapters"
+        #: base vs 학습 모델 정성 비교 기록 (append-only)
+        self.comparisons_path = (
+            Path(comparisons_json) if comparisons_json
+            else self.path.parent / "comparisons.jsonl"
+        )
 
     # ── 저수준 읽기/쓰기 ──────────────────────────────────────────────────
 
@@ -316,6 +322,108 @@ class StateStore:
             series[k] = [r.eval.get(k) for r in records]
         return series
 
+    # ── 최고 성능 체크포인트 ──────────────────────────────────────────────
+
+    def best_checkpoint(
+        self, metric: str = "mean"
+    ) -> Optional[Dict[str, Any]]:
+        """
+        고정 평가셋 지표가 가장 좋은 체크포인트를 고른다.
+
+        Args:
+            metric: "anls" | "accuracy" | "f1" | "mean"(세 지표 평균)
+
+        Returns:
+            {checkpoint, path, score, metric, eval, exists} 또는 None
+            (평가 지표가 기록된 학습 이력이 없으면 None)
+        """
+        scored: List[Dict[str, Any]] = []
+        for r in self.history():
+            if not r.eval:
+                continue
+            if metric == "mean":
+                vals = [
+                    float(r.eval[k]) for k in ("anls", "accuracy", "f1")
+                    if r.eval.get(k) is not None
+                ]
+                if not vals:
+                    continue
+                score = sum(vals) / len(vals)
+            else:
+                if r.eval.get(metric) is None:
+                    continue
+                score = float(r.eval[metric])
+            path = self.adapter_dir / r.checkpoint
+            scored.append({
+                "checkpoint": r.checkpoint,
+                "path": str(path),
+                "score": round(score, 4),
+                "metric": metric,
+                "eval": dict(r.eval),
+                "exists": path.exists(),
+            })
+
+        if not scored:
+            return None
+        # 동점이면 나중 체크포인트를 택한다 (데이터가 더 많이 반영된 쪽)
+        return max(scored, key=lambda x: (x["score"], x["checkpoint"]))
+
+    # ── 정성 비교 기록 ────────────────────────────────────────────────────
+
+    def add_comparison(self, record: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        base 모델 vs 학습 모델 정성 비교 결과를 append 한다.
+
+        지표(ANLS 등)는 표현이 조금만 달라도 점수가 깎여 절대값을 믿기 어렵다.
+        사람이 직접 고른 승패를 쌓아두면 "실제로 나아졌는가"를 훨씬 직접적으로 볼 수 있다.
+        """
+        record = dict(record)
+        record.setdefault("created_at", _now_iso())
+        path = self.comparisons_path
+        with _file_lock(path):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        return record
+
+    def comparisons(self) -> List[Dict[str, Any]]:
+        """기록된 정성 비교 전체."""
+        path = self.comparisons_path
+        if not path.exists():
+            return []
+        out: List[Dict[str, Any]] = []
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    out.append(json.loads(line))
+                except Exception:
+                    continue
+        return out
+
+    def comparison_stats(self, checkpoint: Optional[str] = None) -> Dict[str, Any]:
+        """
+        정성 비교 승패 집계. `checkpoint` 를 주면 그 체크포인트만 센다.
+
+        `win_rate` 는 무승부를 제외한 승률이다 (무승부가 많으면 별도로 보는 편이 낫다).
+        """
+        rows = self.comparisons()
+        if checkpoint:
+            rows = [r for r in rows if r.get("checkpoint") == checkpoint]
+        counts = {"trained": 0, "base": 0, "tie": 0}
+        for r in rows:
+            v = str(r.get("verdict", "")).lower()
+            if v in counts:
+                counts[v] += 1
+        decided = counts["trained"] + counts["base"]
+        return {
+            "n": len(rows),
+            **counts,
+            "win_rate": round(counts["trained"] / decided, 4) if decided else None,
+        }
+
     # ── 초기화 ────────────────────────────────────────────────────────────
 
     def reset(self, keep_adapter: bool = True) -> None:
@@ -342,4 +450,5 @@ def from_config(config_path: str = "dpo_collector/config_dpo.yaml") -> StateStor
         state_json=paths.get("state_json", "dpo_collector/outputs/state.json"),
         history_json=paths.get("history_json", "dpo_collector/outputs/training_history.json"),
         adapter_dir=paths.get("adapter_dir", "dpo_collector/outputs/adapters"),
+        comparisons_json=paths.get("comparisons_jsonl"),
     )

@@ -867,6 +867,224 @@ def playground_infer(
         return f"❌ 추론 실패: {e}"
 
 
+# ─── ⚖️ 모델 비교 탭 ───────────────────────────────────────────────────────
+#
+# 지표(ANLS 등)는 정답이 도표 캡션이라 표현이 조금만 달라도 점수가 깎여 절대값을 믿기 어렵다.
+# 같은 질문에 학습 전/후 답변을 **나란히 놓고 사람이 고르는** 것이 학습 효과를 보는 가장
+# 직접적인 방법이고, 그 승패를 쌓으면 정성 판단을 정량화할 수 있다.
+#
+# 두 모델을 각각 로드하지 않는다. 어댑터를 얹은 모델 하나에서 LoRA 를 켜고 끄면
+# base(학습 전)와 학습 후를 모두 얻을 수 있다 — 메모리가 절반이고, 같은 가중치에서
+# 어댑터만 차이나므로 비교도 더 공정하다.
+
+_BEST_CHOICE = "🏆 최고 성능 (자동 선택)"
+
+
+def comparison_targets(ctx: AppContext, metric: str = "mean") -> Tuple[Any, str]:
+    """비교에 쓸 어댑터 드롭다운 선택지 + 최고 성능 안내 문구."""
+    adapters = ctx.state.list_adapters()
+    choices = [_BEST_CHOICE] + [a["name"] for a in adapters]
+    best = ctx.state.best_checkpoint(metric)
+
+    if not adapters:
+        note = (
+            "⚠️ 학습된 어댑터가 없습니다. 🎯 학습 탭에서 먼저 학습하세요 "
+            "(base 끼리 비교하면 결과가 같습니다)."
+        )
+    elif best is None:
+        note = (
+            f"어댑터 {len(adapters)}개가 있지만 **평가 지표가 기록된 체크포인트가 없어** "
+            "최고 성능을 고를 수 없습니다. 고정 평가셋을 만든 뒤 학습하면 자동 선택됩니다. "
+            "지금은 아래에서 직접 고르세요."
+        )
+    else:
+        ev = " · ".join(f"{k.upper()} {v:.4f}" for k, v in best["eval"].items())
+        warn = "" if best["exists"] else "  ⚠️ 파일이 없습니다"
+        note = (
+            f"🏆 최고 성능: **{best['checkpoint']}** "
+            f"({metric} {best['score']:.4f}) — {ev}{warn}"
+        )
+    return gr.update(choices=choices, value=_BEST_CHOICE), note
+
+
+def _resolve_compare_adapter(
+    ctx: AppContext, selection: Optional[str], metric: str
+) -> Tuple[Optional[str], str]:
+    """드롭다운 선택 → (어댑터 경로, 표시 이름). 없으면 (None, 'base')."""
+    if selection and selection != _BEST_CHOICE:
+        for a in ctx.state.list_adapters():
+            if a["name"] == selection:
+                return a["path"], a["name"]
+        return None, "base"
+    best = ctx.state.best_checkpoint(metric)
+    if best and best["exists"]:
+        return best["path"], best["checkpoint"]
+    # 최고 성능을 못 고르면 활성 어댑터라도 쓴다
+    active = ctx.state.active_adapter
+    return (active, Path(active).name) if active else (None, "base")
+
+
+def load_eval_question(ctx: AppContext, index: float) -> Tuple[str, Any, str]:
+    """고정 평가셋에서 문항을 불러온다 (정답이 있어 비교 판단이 쉬워진다)."""
+    try:
+        items = ctx.evalset.load(verify_frozen=False) if ctx.evalset else []
+    except Exception as e:
+        return "", gr.update(), f"❌ 평가셋을 읽지 못했습니다: {e}"
+    if not items:
+        return "", gr.update(), (
+            "⚠️ 확정된 평가셋이 없습니다. "
+            "`python -m dpo_collector.eval_ko draft` → 검토 → `confirm` 을 먼저 하세요."
+        )
+    i = int(index) % len(items)
+    it = items[i]
+    gold = " / ".join(it.ground_truths[:3])
+    return (
+        it.question,
+        gr.update(value=list(it.image_paths)),
+        f"📋 평가셋 {i + 1}/{len(items)} · `{it.paper_id[:40]}`\n\n"
+        f"**참고 정답**: {gold}",
+    )
+
+
+def run_comparison(
+    ctx: AppContext,
+    question: str,
+    images: Optional[List[Any]],
+    adapter_choice: Optional[str],
+    metric: str,
+    max_new_tokens: float,
+    temperature: float,
+    progress=gr.Progress(),
+) -> Tuple[str, str, str, Dict[str, Any]]:
+    """
+    같은 입력으로 base(학습 전)와 학습 모델의 답변을 각각 생성한다.
+
+    Returns: (base 답변, 학습 모델 답변, 헤더 안내, 비교 세션)
+    """
+    import time
+
+    empty: Dict[str, Any] = {}
+    question = (question or "").strip()
+    if not question:
+        return "", "", "⚠️ 질문을 입력하거나 평가셋에서 불러오세요.", empty
+
+    image_paths = _normalize_images(images)
+    adapter_path, label = _resolve_compare_adapter(ctx, adapter_choice, metric)
+    if adapter_path is None:
+        return "", "", (
+            "⚠️ 비교할 학습 모델이 없습니다. 먼저 🎯 학습 탭에서 학습하세요."
+        ), empty
+
+    try:
+        from .backends import get_shared_backend
+
+        progress(0.1, desc=f"모델 로드 중… ({label})")
+        backend = get_shared_backend(
+            ctx.cfg.get("model", {}), adapter_path=adapter_path, autoload=True
+        )
+
+        def _infer(adapter_on: bool) -> Tuple[str, float]:
+            backend.set_adapter_enabled(adapter_on)
+            t0 = time.time()
+            out = backend.infer(
+                image_paths, question,
+                max_new_tokens=int(max_new_tokens), temperature=float(temperature),
+            )
+            return (out or "").strip(), round(time.time() - t0, 1)
+
+        progress(0.35, desc="학습 전(base) 추론 중…")
+        base_ans, base_sec = _infer(False)
+        progress(0.7, desc=f"학습 후({label}) 추론 중…")
+        tuned_ans, tuned_sec = _infer(True)
+        backend.set_adapter_enabled(True)   # 다른 탭에 영향 없도록 원복
+
+        same = " ".join(base_ans.split()) == " ".join(tuned_ans.split())
+        header = (
+            f"**질문**: {question}\n\n"
+            f"학습 전 `base` ({base_sec}s)  ·  학습 후 `{label}` ({tuned_sec}s)"
+            + ("\n\n> ℹ️ 두 답변이 완전히 같습니다 — 학습량이 적거나 이 질문에서는 "
+               "차이가 나지 않는 경우입니다. temperature 를 올리거나 다른 질문을 시도해 보세요."
+               if same else "")
+        )
+        session = {
+            "question": question,
+            "images": image_paths,
+            "checkpoint": label,
+            "base_answer": base_ans,
+            "tuned_answer": tuned_ans,
+            "temperature": float(temperature),
+            "identical": same,
+        }
+        return (
+            base_ans or "_(빈 응답)_",
+            tuned_ans or "_(빈 응답)_",
+            header,
+            session,
+        )
+
+    except Exception as e:
+        logger.exception("[UI] 모델 비교 실패")
+        return "", "", f"❌ 비교 실패: {e}", empty
+
+
+def save_comparison(
+    ctx: AppContext,
+    session: Dict[str, Any],
+    verdict: Optional[str],
+    note: str,
+) -> Tuple[str, str]:
+    """정성 판정을 기록하고 누적 승률을 돌려준다."""
+    if not session or not session.get("question"):
+        return "⚠️ 먼저 비교를 실행하세요.", comparison_summary(ctx)
+    if not verdict:
+        return "⚠️ 어느 쪽이 나은지 선택하세요.", comparison_summary(ctx)
+    try:
+        rec = ctx.state.add_comparison({
+            **session,
+            "verdict": verdict,
+            "note": note or "",
+            "annotator": "user",
+        })
+        return (
+            f"✅ 기록됨 — `{rec['checkpoint']}` / 판정 **{verdict}**",
+            comparison_summary(ctx),
+        )
+    except Exception as e:
+        logger.exception("[UI] 비교 기록 실패")
+        return f"❌ 기록 실패: {e}", comparison_summary(ctx)
+
+
+def comparison_summary(ctx: AppContext) -> str:
+    """누적 정성 비교 승률 (체크포인트별)."""
+    try:
+        rows = ctx.state.comparisons()
+    except Exception as e:
+        return f"_집계 실패: {e}_"
+    if not rows:
+        return "_아직 기록된 비교가 없습니다._"
+
+    ckpts: List[str] = []
+    for r in rows:
+        c = r.get("checkpoint", "?")
+        if c not in ckpts:
+            ckpts.append(c)
+
+    lines = [
+        "| 체크포인트 | 비교 | 학습 승 | base 승 | 비김 | 승률(무승부 제외) |",
+        "|---|---:|---:|---:|---:|---:|",
+    ]
+    for c in ckpts:
+        s = ctx.state.comparison_stats(c)
+        wr = f"{s['win_rate']:.0%}" if s["win_rate"] is not None else "—"
+        lines.append(
+            f"| `{c}` | {s['n']} | {s['trained']} | {s['base']} | {s['tie']} | **{wr}** |"
+        )
+    total = ctx.state.comparison_stats()
+    twr = f"{total['win_rate']:.0%}" if total["win_rate"] is not None else "—"
+    lines.append(f"\n전체 {total['n']}건 · 학습 모델 승률 **{twr}**")
+    return "\n".join(lines)
+
+
 # ─── 📦 내보내기 탭 ────────────────────────────────────────────────────────
 
 def run_export(
@@ -1335,6 +1553,91 @@ def build_ui(ctx: AppContext) -> gr.Blocks:
                     with gr.Column(scale=1):
                         pg_output = gr.Markdown("")
 
+            # ── ⚖️ 모델 비교 ──────────────────────────────────────────────
+            with gr.Tab("⚖️ 모델 비교"):
+                gr.Markdown(
+                    "같은 질문에 **학습 전(base)** 과 **학습 후** 답변을 나란히 놓고 비교합니다.\n"
+                    "지표만으로는 드러나지 않는 문체·정확도·언어 품질 차이를 눈으로 확인하고, "
+                    "판정을 쌓으면 승률로 정량화됩니다."
+                )
+                _cmp_dd, _cmp_note = comparison_targets(ctx)
+                with gr.Row():
+                    cmp_adapter = gr.Dropdown(
+                        choices=_cmp_dd.get("choices") or [_BEST_CHOICE],
+                        value=_BEST_CHOICE, scale=3,
+                        label="비교할 학습 모델",
+                    )
+                    cmp_metric = gr.Dropdown(
+                        choices=[
+                            ("세 지표 평균", "mean"), ("ANLS", "anls"),
+                            ("Accuracy", "accuracy"), ("F1", "f1"),
+                        ],
+                        value="mean", scale=2,
+                        label="최고 성능 판단 기준",
+                    )
+                    cmp_refresh = gr.Button("🔄 목록 새로고침", scale=1)
+                cmp_best_note = gr.Markdown(_cmp_note)
+
+                with gr.Row():
+                    with gr.Column(scale=3):
+                        cmp_question = gr.Textbox(
+                            label="질문", lines=3,
+                            placeholder="예: 이 그림이 무엇을 보여주는지 설명해 주세요.",
+                        )
+                        cmp_images = gr.Gallery(
+                            label="이미지", columns=4, height=170, allow_preview=True,
+                        )
+                        cmp_upload = gr.File(
+                            label="이미지 추가", file_count="multiple",
+                            file_types=["image"],
+                        )
+                    with gr.Column(scale=2):
+                        gr.Markdown("**평가셋에서 문항 불러오기** — 정답이 있어 판단이 쉽습니다")
+                        with gr.Row():
+                            cmp_eval_idx = gr.Number(
+                                value=0, precision=0, label="문항 번호", scale=1,
+                            )
+                            cmp_load_eval = gr.Button("📋 불러오기", scale=1)
+                        cmp_eval_note = gr.Markdown("")
+                        with gr.Row():
+                            cmp_tokens = gr.Slider(
+                                32, 1024, value=256, step=32, label="max_new_tokens",
+                            )
+                            cmp_temp = gr.Slider(
+                                0.0, 1.5, value=0.0, step=0.1,
+                                label="temperature (0 = greedy, 비교엔 0 권장)",
+                            )
+                        cmp_run = gr.Button("⚖️ 두 모델로 답변 생성", variant="primary")
+
+                cmp_header = gr.Markdown("")
+                with gr.Row():
+                    with gr.Column():
+                        gr.Markdown("### ⚪ 학습 전 (base)")
+                        cmp_base_out = gr.Markdown("")
+                    with gr.Column():
+                        gr.Markdown("### 🟢 학습 후")
+                        cmp_tuned_out = gr.Markdown("")
+
+                gr.Markdown("---")
+                gr.Markdown("#### 어느 쪽이 더 나은가요?")
+                with gr.Row():
+                    cmp_verdict = gr.Radio(
+                        choices=[
+                            ("🟢 학습 후가 낫다", "trained"),
+                            ("⚪ 학습 전이 낫다", "base"),
+                            ("= 비슷하다", "tie"),
+                        ],
+                        value=None, label=None, scale=3,
+                    )
+                    cmp_note_box = gr.Textbox(
+                        label="메모 (선택)", scale=3,
+                        placeholder="예: 학습 후가 중국어 혼입이 줄었음",
+                    )
+                    cmp_save = gr.Button("💾 판정 기록", variant="primary", scale=1)
+                cmp_save_msg = gr.Markdown("")
+                gr.Markdown("#### 누적 결과")
+                cmp_stats = gr.Markdown(comparison_summary(ctx))
+
             # ── 📦 내보내기 ───────────────────────────────────────────────
             with gr.Tab("📦 내보내기"):
                 gr.Markdown(
@@ -1673,6 +1976,44 @@ def build_ui(ctx: AppContext) -> gr.Blocks:
                 playground_infer(ctx, q, imgs, mt, t, cmp_, progress),
             inputs=[pg_question, pg_images, pg_max_tokens, pg_temp, pg_compare],
             outputs=[pg_output],
+        )
+
+        # ── 모델 비교 탭 ──────────────────────────────────────────────────
+        cmp_session = gr.State({})
+
+        cmp_refresh.click(
+            lambda m: comparison_targets(ctx, m),
+            inputs=[cmp_metric], outputs=[cmp_adapter, cmp_best_note],
+        )
+        cmp_metric.change(
+            lambda m: comparison_targets(ctx, m),
+            inputs=[cmp_metric], outputs=[cmp_adapter, cmp_best_note],
+        )
+        cmp_upload.change(
+            lambda files, cur: gr.update(
+                value=_normalize_images(cur) + _normalize_images(files)
+            ),
+            inputs=[cmp_upload, cmp_images], outputs=[cmp_images],
+        )
+        cmp_load_eval.click(
+            lambda i: load_eval_question(ctx, i),
+            inputs=[cmp_eval_idx], outputs=[cmp_question, cmp_images, cmp_eval_note],
+        )
+        cmp_run.click(
+            lambda q, imgs, ad, m, mt, t, progress=gr.Progress():
+                run_comparison(ctx, q, imgs, ad, m, mt, t, progress),
+            inputs=[cmp_question, cmp_images, cmp_adapter, cmp_metric,
+                    cmp_tokens, cmp_temp],
+            outputs=[cmp_base_out, cmp_tuned_out, cmp_header, cmp_session],
+        ).then(
+            # 새 비교가 나왔으니 이전 판정을 비운다 (직전 판정이 남아 오기록되는 것 방지)
+            lambda: (gr.update(value=None), gr.update(value=""), gr.update(value="")),
+            outputs=[cmp_verdict, cmp_note_box, cmp_save_msg],
+        )
+        cmp_save.click(
+            lambda s, v, n: save_comparison(ctx, s, v, n),
+            inputs=[cmp_session, cmp_verdict, cmp_note_box],
+            outputs=[cmp_save_msg, cmp_stats],
         )
 
         # ── 내보내기 탭 ───────────────────────────────────────────────────
